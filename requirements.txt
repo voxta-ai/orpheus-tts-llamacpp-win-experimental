@@ -1,0 +1,4 @@
+snac
+llama-cpp-python@https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.8-cu124-win-20250321/llama_cpp_python-0.3.8-cp312-cp312-win_amd64.whl
+transformers
+soundfile
