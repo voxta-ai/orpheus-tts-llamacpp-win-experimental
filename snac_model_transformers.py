@@ -9,6 +9,8 @@ import logging
 from snac import SNAC
 from stopwatch import Stopwatch
 
+logger = logging.getLogger(__name__)
+
 class SnacModel:
     def __init__(self, snac_path: str):
         self.snac_device = "cuda"
@@ -16,11 +18,14 @@ class SnacModel:
         model = SNAC(**config)
         safetensors_path = next(Path(snac_path).glob("*.safetensors"))
         st.load_model(model, safetensors_path, device=self.snac_device)
-        self.snac_model = model.to(self.snac_device)
+        self.snac_model = torch.compile(
+            model.to(self.snac_device),
+            mode="max-autotune"
+        )
 
     def load_audio(self, voice_path: str):
         voice_audio, sr = sf.read(voice_path, dtype='float32')
-        max_seconds = 30
+        max_seconds = 45
         max_len = max_seconds * sr
         if len(voice_audio) > max_len:
             raise ValueError(f"Audio too long: {len(voice_audio)} samples ({len(voice_audio) / sr:.2f} seconds), maximum is {max_seconds} seconds")
@@ -53,25 +58,24 @@ class SnacModel:
             return all_codes.tolist()
 
     def convert_audio_tokens_to_speech(self, generated: list[int]) -> list[torch.Tensor]:
-        with Stopwatch("SNAC decoding"):
-            tokens = torch.tensor([generated], dtype=torch.int64)
-            assert tokens.ndim == 2 and tokens.size(0) == 1, "Expected shape (1, T)"
-            row = tokens[0]
-            token_to_remove = 128258
-            count_before = row.size(0)
-            row = row[row != token_to_remove]
-            if row.size(0) != count_before:
-                logging.warning(f"Removing {count_before - row.size(0)} tokens")
-            usable_len = (row.size(0) // 7) * 7
-            if usable_len == 0:
-                return []
-            if row.size(0) != usable_len:
-                logging.warning(f"Trimming {row.size(0) - usable_len} tokens")
-            trimmed = row[:usable_len] - 128266
-            if trimmed.size(0) != row.size(0):
-                logging.warning(f"Trimmed to {trimmed.size(0)} tokens")
-            result = [self._redistribute_codes(trimmed.tolist())]
-            return result
+        tokens = torch.tensor([generated], dtype=torch.int64)
+        assert tokens.ndim == 2 and tokens.size(0) == 1, "Expected shape (1, T)"
+        row = tokens[0]
+        token_to_remove = 128258
+        count_before = row.size(0)
+        row = row[row != token_to_remove]
+        if row.size(0) != count_before:
+            logger.warning(f"Removing {count_before - row.size(0)} tokens")
+        usable_len = (row.size(0) // 7) * 7
+        if usable_len == 0:
+            return []
+        if row.size(0) != usable_len:
+            logger.warning(f"Trimming {row.size(0) - usable_len} tokens")
+        trimmed = row[:usable_len] - 128266
+        if trimmed.size(0) != row.size(0):
+            logger.warning(f"Trimmed to {trimmed.size(0)} tokens")
+        result = [self._redistribute_codes(trimmed.tolist())]
+        return result
 
     def _redistribute_codes(self, code_list: list[int]) -> torch.Tensor:
         if len(code_list) < 7:
@@ -93,5 +97,10 @@ class SnacModel:
         with torch.inference_mode():
             return self.snac_model.decode(codes)
 
-    def to_audio_bytes(self, samples: list[torch.Tensor]) -> list[bytes]:
-        return [(s.squeeze().cpu().numpy() * 32767).astype(np.int16).tobytes() for s in samples]
+    def to_numpy_array(self, samples: list[torch.Tensor]) -> np.ndarray:
+        return np.concatenate([
+            s.squeeze().cpu().numpy() for s in samples
+        ])
+    
+    def to_bytes(self, array: np.ndarray) -> bytes:
+        return (array * 32767).astype(np.int16).tobytes()

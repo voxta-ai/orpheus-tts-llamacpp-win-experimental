@@ -9,6 +9,8 @@ import time
 from transformers.utils.logging import disable_progress_bar
 disable_progress_bar()
 
+logger = logging.getLogger(__name__)
+
 class OrpheusModelTransformers:
     def __init__(
             self,
@@ -41,15 +43,15 @@ class OrpheusModelTransformers:
         if voice_path:
             cache_key = (voice_path, voice_text)
             if cache_key in self._cache:
-                logging.info("Using cached input_ids")
+                logger.info("Using cached input_ids")
                 zeroprompt_input_ids = self._cache[cache_key]
             else:
-                logging.info("Tokenizing voice")
+                logger.info("Tokenizing voice")
                 st = time.monotonic()
                 voice_audio_tokens = self.audio_model.load_audio(voice_path)
                 voice_transcript_ids = self.tokenizer(voice_text, return_tensors="pt")["input_ids"]
                 zeroprompt_input_ids = torch.cat([start_tokens, voice_transcript_ids, end_tokens, torch.tensor([voice_audio_tokens], dtype=torch.int64), final_tokens], dim=1)
-                logging.info(f"Tokenized voice ({zeroprompt_input_ids.size(1)} tokens) in {time.monotonic() - st:.2f}s")
+                logger.info(f"Tokenized voice ({zeroprompt_input_ids.size(1)} tokens) in {time.monotonic() - st:.2f}s")
                 if len(self._cache) > 9:
                     self._cache.popitem(last=False)
                 self._cache[cache_key] = zeroprompt_input_ids.cpu().detach().clone()
@@ -80,9 +82,9 @@ class OrpheusModelTransformers:
         use_continuation: bool,
     ) -> bytes:
         if greedy_snac_tokens > 0:
-            logging.warning("greedy_snac_tokens is not supported with safetensors")
+            logger.warning("greedy_snac_tokens is not supported with safetensors")
         if use_continuation:
-            logging.warning("use_continuation is not supported with safetensors")
+            logger.warning("use_continuation is not supported with safetensors")
 
         torch.cuda.empty_cache()
 
@@ -97,7 +99,7 @@ class OrpheusModelTransformers:
         for token in input_ids[0, -4:]:
             token_str = self.tokenizer.decode([token])
             debug_tokens.append(f'{token} "{token_str}"')
-        logging.info(f"Input: {', '.join(debug_tokens)}")
+        logger.info(f"Input: {', '.join(debug_tokens)}")
 
         st = time.monotonic()
         with torch.no_grad():
@@ -117,7 +119,7 @@ class OrpheusModelTransformers:
             )
         generated = generated_ids[0].tolist()
         generated = generated[len(input_ids[0]):]
-        logging.info(f"Generated {len(generated)} tokens in {time.monotonic() - st:.2f}s")
+        logger.info(f"Generated {len(generated)} tokens in {time.monotonic() - st:.2f}s")
 
         debug_tokens = []
         for token in generated[:8]:
@@ -128,7 +130,7 @@ class OrpheusModelTransformers:
             token_str = self.tokenizer.decode([token])
             debug_tokens.append(f'{token} "{token_str}"')
 
-        logging.info(f"Tokens: {', '.join(debug_tokens)}")
+        logger.info(f"Tokens: {', '.join(debug_tokens)}")
 
         with Stopwatch("Converting speech to audio") as sw:
             audio = self.audio_model.convert_audio_tokens_to_speech(generated)

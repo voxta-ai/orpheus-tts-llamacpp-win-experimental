@@ -2,7 +2,7 @@ import os
 import struct
 import logging
 import numpy as np
-from typing import Optional
+from typing import Iterable, Optional
 from ctypes import c_ubyte, c_long, POINTER, cast, create_string_buffer
 from snac_model_transformers import SnacModel
 from stopwatch import Stopwatch
@@ -10,6 +10,8 @@ from cache_manager import StateCacheManager
 import llama_cpp
 
 llama_cpp.llama_backend_init(numa=True)
+
+logger = logging.getLogger(__name__)
 
 class OrpheusModelLlamaCpp:
     def __init__(self, model_path: str, audio_model: SnacModel):
@@ -71,6 +73,7 @@ class OrpheusModelLlamaCpp:
         cursor = 0
 
         batch = llama_cpp.llama_batch_init(batch_size, 0, 1)
+        log_enabled = logger.isEnabledFor(logging.DEBUG)
         try:
             while cursor < total:
                 chunk = tokens[cursor:cursor + batch_size]
@@ -78,7 +81,8 @@ class OrpheusModelLlamaCpp:
                 if k == 0:
                     break
 
-                logging.debug(f"Processing chunk of {k} tokens (total context: {self.n_past + k})")
+                if log_enabled:
+                    logger.debug(f"Processing chunk of {k} tokens (total context: {self.n_past + k})")
                 batch.n_tokens = k
                 is_last_chunk = (cursor + batch_size) >= total
 
@@ -93,7 +97,7 @@ class OrpheusModelLlamaCpp:
                 ret = llama_cpp.llama_decode(self.ctx, batch)
 
                 if ret != 0:
-                    logging.error(f"llama_decode failed at n_past {self.n_past}: {chunk}")
+                    logger.error(f"llama_decode failed at n_past {self.n_past}: {chunk}")
                     return
 
                 self.n_past += k
@@ -111,7 +115,7 @@ class OrpheusModelLlamaCpp:
             repetition_penalty: float,
             greedy_snac_tokens: int = 0,
             force_continuation: int = 0
-        ) -> list[int]:
+        ) -> Iterable[int]:
         sampler_chain = self._acquire_sampler_chain(temperature, top_p, min_p, repetition_penalty)
         greedy_chain = self._acquire_greedy_chain() if greedy_snac_tokens else None
         continuation_chain = self._acquire_continuation_chain(temperature, top_p, min_p, repetition_penalty) if force_continuation else None
@@ -119,7 +123,7 @@ class OrpheusModelLlamaCpp:
         continuation_remaining = force_continuation
         snac_index = 0
         snac_greedy = 7 - greedy_snac_tokens
-        generated = []
+        first = True
         batch = llama_cpp.llama_batch_init(1, 0, 1)
 
         try:
@@ -135,12 +139,15 @@ class OrpheusModelLlamaCpp:
                     continuation_remaining -= 1
 
                 token_id = llama_cpp.llama_sampler_sample(chain, self.ctx, -1)
-                if token_id in stop_token_ids:
-                    if not generated:
-                        logging.warning(f"Stopping early due to stop token {token_id}")
-                    break
 
-                generated.append(token_id)
+                if token_id in stop_token_ids:
+                    if first:
+                        logger.warning(f"Stopping early due to stop token {token_id}")
+                    break
+                first = False
+
+                yield token_id
+                
                 batch.n_tokens = 1
                 batch.token[0] = token_id
                 batch.pos[0] = self.n_past
@@ -151,8 +158,6 @@ class OrpheusModelLlamaCpp:
                 self.n_past += 1
         finally:
             llama_cpp.llama_batch_free(batch)
-
-        return generated
     
     def _acquire_greedy_chain(self):
         if self._greedy_sampler_chain:
@@ -223,7 +228,7 @@ class OrpheusModelLlamaCpp:
         top_indices = np.argsort(probs)[-top_n:][::-1]
         for token_id in top_indices:
             prob = probs[token_id]
-            logging.info(f"{token_id}: {prob:.4%}")
+            logger.info(f"{token_id}: {prob:.4%}")
 
     def save_state(self) -> tuple[bytes, int]:
         state_size = llama_cpp.llama_get_state_size(self.ctx)
@@ -253,8 +258,9 @@ class OrpheusModelLlamaCpp:
         max_tokens: int,
         repetition_penalty: float,
         greedy_snac_tokens: int,
-        use_continuation: bool
-    ) -> bytes:
+        use_continuation: bool,
+        streaming: bool = True
+    ) -> Iterable[bytes]:
         with Stopwatch("Full generation"):
             cache_key = (finetune_voice, voice_path, voice_transcript) if voice_path else None
 
@@ -300,21 +306,110 @@ class OrpheusModelLlamaCpp:
                 self.process_tokens(prompt_ids)
                 sw.append(f"{len(prompt_ids)} tokens")
 
-            with Stopwatch("Generating speech") as sw:
-                generated = self.generate_tokens(
-                    max_tokens=max_tokens,
-                    stop_token_ids=self.prompt_formatter.STOP, 
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
-                    repetition_penalty=repetition_penalty,
-                    greedy_snac_tokens=greedy_snac_tokens,
-                    force_continuation=0 if not use_continuation else 7 * 8 # 8 SNAC samples
-                )
-                sw.append(f"{len(generated)} tokens")
-            
-            self.previous_generation_cache = (request_text_ids, generated)
+            ttfbStopwatch = Stopwatch("Time to first byte")
+            ttfbStopwatch.__enter__()
+            with Stopwatch("Generating speech") as sw, Stopwatch("Orpheus tokens", auto_start=False) as tkSw, Stopwatch("SNAC decode", auto_start=False) as swSnac, Stopwatch("Audio processing", auto_start=False) as swBytes:
+                SAMPLES_PER_FRAME = 2048
+                SNAC_TOKENS_PER_FRAME = 7
+                OVERLAP_FRAMES = 2
+                OVERLAP_TOKENS = OVERLAP_FRAMES * SNAC_TOKENS_PER_FRAME
+                OVERLAP_SAMPLES = OVERLAP_FRAMES * SAMPLES_PER_FRAME
+                CHUNK_SIZE = SNAC_TOKENS_PER_FRAME * 5 # 100ms
+                token_buffer = []
+                generated = []
+                pending_overlap_tokens = []
+                pending_overlap_audio = None
 
+                tkSw.start()
+                for token in self.generate_tokens(
+                        max_tokens=max_tokens,
+                        stop_token_ids=self.prompt_formatter.STOP, 
+                        temperature=temperature,
+                        top_p=top_p,
+                        min_p=min_p,
+                        repetition_penalty=repetition_penalty,
+                        greedy_snac_tokens=greedy_snac_tokens,
+                        force_continuation=0 if not use_continuation else 7 * 8 # 8 SNAC samples
+                    ):
+                    tkSw.stop()
+
+                    if streaming:
+                        token_buffer.append(token)
+
+                        # Whenever we have enough for one "chunk + overlap"
+                        if len(token_buffer) == CHUNK_SIZE:
+                            # Prepend any overlap tokens from previous chunk so we can regenerate overlap frames
+                            chunk_tokens = pending_overlap_tokens + token_buffer[:CHUNK_SIZE]
+                            del token_buffer[:CHUNK_SIZE]  # remove consumed tokens
+
+                            # Convert tokens to audio
+                            swSnac.start()
+                            hat = self.audio_model.convert_audio_tokens_to_speech(chunk_tokens)
+                            swSnac.stop()
+
+                            swBytes.start()
+                            np_audio = self.audio_model.to_numpy_array(hat)
+
+                            # The actual chunk minus the final overlap (so we "keep aside" only the last frames)
+                            main_chunk = np_audio[:-OVERLAP_SAMPLES] if len(np_audio) > OVERLAP_SAMPLES else np.array([], dtype=np.float32)
+
+                            # Crossfade with pending overlap audio if it exists
+                            if pending_overlap_audio is not None:
+                                # Crossfade the chunk's overlap with the old overlap
+                                main_chunk = self.crossfade(pending_overlap_audio, main_chunk)
+
+                            # Yield main chunk (no overlap portion at the end)
+                            if len(main_chunk) > 0:
+                                yield self.audio_model.to_bytes(main_chunk)
+                                if ttfbStopwatch:
+                                    ttfbStopwatch.__exit__(None, None, None)
+                                    ttfbStopwatch = None
+
+                            # Save the last overlap frames for the next chunk's crossfade
+                            pending_overlap_audio = np_audio[-OVERLAP_SAMPLES:] if len(np_audio) >= OVERLAP_SAMPLES else np_audio
+
+                            # Also keep last overlap tokens to regenerate the start of the next chunk
+                            pending_overlap_tokens = chunk_tokens[-OVERLAP_TOKENS:] if len(chunk_tokens) >= OVERLAP_TOKENS else chunk_tokens
+
+                            generated += chunk_tokens
+                            swBytes.stop()
+                    else:
+                        generated.append(token)
+                
+                    tkSw.start()
+                tkSw.stop()
+
+                if streaming:
+                    # Final flush if leftover tokens
+                    if len(token_buffer) >= SNAC_TOKENS_PER_FRAME:
+                        # Prepend overlap tokens for final generation
+                        chunk_tokens = pending_overlap_tokens + token_buffer
+                        swSnac.start()
+                        hat = self.audio_model.convert_audio_tokens_to_speech(chunk_tokens)
+                        swSnac.stop()
+                        swBytes.start()
+                        np_audio = self.audio_model.to_numpy_array(hat)
+
+                        # Crossfade final chunk if needed
+                        if pending_overlap_audio is not None:
+                            main_chunk = self.crossfade(pending_overlap_audio, np_audio)
+                        else:
+                            main_chunk = np_audio
+
+                        # Fade out TODO
+
+                        yield self.audio_model.to_bytes(main_chunk)
+                        if ttfbStopwatch:
+                            ttfbStopwatch.__exit__(None, None, None)
+                            ttfbStopwatch = None
+
+                        generated += chunk_tokens
+                        swBytes.stop()
+
+            sw.append(f"{len(generated)} tokens")
+            self.previous_generation_cache = (request_text_ids, generated)
+        
+        if not streaming:
             with Stopwatch("SNAC decoding"):
                 audio = self.audio_model.convert_audio_tokens_to_speech(generated)
 
@@ -323,6 +418,12 @@ class OrpheusModelLlamaCpp:
                 sw.append(f"{len(bytes) / 1024:.2f} KB")
                 return bytes
 
+    def crossfade(self, prev: np.ndarray, current: np.ndarray) -> np.ndarray:
+        fade_len = min(len(prev), len(current))
+        fade = np.linspace(0, 1, fade_len)
+        cross = prev[-fade_len:] * (1 - fade) + current[:fade_len] * fade
+        return np.concatenate([cross, current[fade_len:]], axis=0)
+    
     def __del__(self):
         if self._sampler_chain:
             llama_cpp.llama_sampler_free(self._sampler_chain)
@@ -398,4 +499,4 @@ class OrpheusPromptFormatterLlamaCpp:
                 str = self.tts_model.detokenize_text([t], special=True)
                 result.append(f'{t}: "{str}"')
                 in_snac = False
-        logging.info(f"Prompt: {', '.join(result)}")
+        logger.info(f"Prompt: {', '.join(result)}")

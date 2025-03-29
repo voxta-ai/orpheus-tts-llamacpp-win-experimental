@@ -8,7 +8,8 @@ import wave
 import winsound
 from orpheus_engine import create_orpheus_engine
 
-logging.getLogger().setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
 
 class OrpheusTest:
     def __init__(self):
@@ -53,30 +54,31 @@ class OrpheusTest:
         id = 1
 
         for i in range(self.warmup_runs):
-            chunks = self.run_one()
+            bytes = self.run_one()
             if i == 0:
-                self.save_audio(chunks, 0)
+                self.save_audio(bytes, 0)
 
         timings = []    
         for i in range(self.runs):
             id += 1
             st = time.monotonic()
-            chunks = self.run_one()
+            bytes = self.run_one()
             timings.append(time.monotonic() - st)
-            self.save_audio(chunks, i)
+            self.save_audio(bytes, i)
         
         # Calculate statistics
         mean_time = statistics.mean(timings)
         median_time = statistics.median(timings)
         min_time = min(timings)
         max_time = max(timings)
-        logging.info(f"Mean time: {mean_time:.3f} seconds")
-        logging.info(f"Median time: {median_time:.3f} seconds")
-        logging.info(f"Min time: {min_time:.3f} seconds")
-        logging.info(f"Max time: {max_time:.3f} seconds")
+        logger.info(f"Mean time: {mean_time:.3f} seconds")
+        logger.info(f"Median time: {median_time:.3f} seconds")
+        logger.info(f"Min time: {min_time:.3f} seconds")
+        logger.info(f"Max time: {max_time:.3f} seconds")
     
-    def run_one(self):
-        return self.engine.generate_speech(
+    def run_one(self) -> bytes:
+        buffer = io.BytesIO()
+        for chunk in self.engine.generate_speech(
             finetune_voice=self.voice,
             greedy_snac_tokens=3,
             max_tokens=self.max_tokens,
@@ -90,9 +92,11 @@ class OrpheusTest:
             repetition_penalty=1.2,
             previous_text=None,
             reply_to=None,
-        )
+        ):
+            buffer.write(chunk)
+        return buffer.getvalue()
         
-    def save_audio(self, chunks, i):
+    def save_audio(self, bytes, i):
         tmp_file = os.path.join(self.output_path, self.model_filename + "-" + str(i) + ".wav")
         try:
             os.remove(tmp_file)
@@ -104,9 +108,7 @@ class OrpheusTest:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(24000)
-
-            for audio_chunk in chunks:
-                wf.writeframes(audio_chunk)
+            wf.writeframes(bytes)
 
         with open(tmp_file, "wb") as f:
             f.write(wav_buffer.getvalue())
