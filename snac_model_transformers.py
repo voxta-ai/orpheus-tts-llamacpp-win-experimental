@@ -57,25 +57,20 @@ class SnacModel:
             all_codes[6::7] = c2[0, :4*L][3::4] + 128266 + 6 * 4096
             return all_codes.tolist()
 
-    def convert_audio_tokens_to_speech(self, generated: list[int]) -> list[torch.Tensor]:
+    def convert_audio_tokens_to_speech(self, generated: list[int]) -> torch.Tensor:
         tokens = torch.tensor([generated], dtype=torch.int64)
         assert tokens.ndim == 2 and tokens.size(0) == 1, "Expected shape (1, T)"
         row = tokens[0]
-        token_to_remove = 128258
-        count_before = row.size(0)
-        row = row[row != token_to_remove]
-        if row.size(0) != count_before:
-            logger.warning(f"Removing {count_before - row.size(0)} tokens")
         usable_len = (row.size(0) // 7) * 7
         if usable_len == 0:
-            return []
-        if row.size(0) != usable_len:
-            logger.warning(f"Trimming {row.size(0) - usable_len} tokens")
+            return None
         trimmed = row[:usable_len] - 128266
-        if trimmed.size(0) != row.size(0):
-            logger.warning(f"Trimmed to {trimmed.size(0)} tokens")
-        result = [self._redistribute_codes(trimmed.tolist())]
-        return result
+        try:
+            result = self._redistribute_codes(trimmed.tolist())
+            return result
+        except:
+            logger.exception(f"Error during decoding tokens: {row[:usable_len]}")
+            return None
 
     def _redistribute_codes(self, code_list: list[int]) -> torch.Tensor:
         if len(code_list) < 7:
@@ -94,13 +89,15 @@ class SnacModel:
             torch.tensor(layer_2, dtype=torch.int64, device=self.snac_device).unsqueeze(0),
             torch.tensor(layer_3, dtype=torch.int64, device=self.snac_device).unsqueeze(0),
         ]
+
+        if torch.any(codes[0] < 0) or torch.any(codes[0] > 4096) or torch.any(codes[1] < 0) or torch.any(codes[1] > 4096) or torch.any(codes[2] < 0) or torch.any(codes[2] > 4096):
+            raise ValueError(f"Invalid SNAC tokens received")
+
         with torch.inference_mode():
             return self.snac_model.decode(codes)
 
-    def to_numpy_array(self, samples: list[torch.Tensor]) -> np.ndarray:
-        return np.concatenate([
-            s.squeeze().cpu().numpy() for s in samples
-        ])
+    def to_numpy_array(self, samples: torch.Tensor) -> np.ndarray:
+        return samples.squeeze().cpu().numpy()
     
     def to_bytes(self, array: np.ndarray) -> bytes:
         return (array * 32767).astype(np.int16).tobytes()

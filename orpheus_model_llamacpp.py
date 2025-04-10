@@ -21,8 +21,8 @@ class OrpheusModelLlamaCpp:
         self.model = llama_cpp.llama_load_model_from_file(model_path.encode(), model_params)
         self.vocab = llama_cpp.llama_model_get_vocab(self.model)
         ctx_params = llama_cpp.llama_context_default_params()
-        ctx_params.n_ctx = 8192
-        ctx_params.n_batch = 512
+        ctx_params.n_ctx = 4096
+        ctx_params.n_batch = 256
         self.ctx = llama_cpp.llama_new_context_with_model(self.model, ctx_params)
 
         self.tokens_state_cache = StateCacheManager(4)
@@ -68,7 +68,7 @@ class OrpheusModelLlamaCpp:
         )
         return text.value.decode("utf-8")
 
-    def process_tokens(self, tokens: list[int], batch_size=512) -> None:
+    def process_tokens(self, tokens: list[int], batch_size=256) -> None:
         total = len(tokens)
         cursor = 0
 
@@ -116,6 +116,8 @@ class OrpheusModelLlamaCpp:
             greedy_snac_tokens: int = 0,
             force_continuation: int = 0
         ) -> Iterable[int]:
+        greedy_snac_tokens = min(7, max(0, greedy_snac_tokens))
+
         sampler_chain = self._acquire_sampler_chain(temperature, top_p, min_p, repetition_penalty)
         greedy_chain = self._acquire_greedy_chain() if greedy_snac_tokens else None
         continuation_chain = self._acquire_continuation_chain(temperature, top_p, min_p, repetition_penalty) if force_continuation else None
@@ -154,7 +156,12 @@ class OrpheusModelLlamaCpp:
                 batch.seq_id[0][0] = 0
                 batch.n_seq_id[0] = 1
                 batch.logits[0] = True
-                llama_cpp.llama_decode(self.ctx, batch)
+                ret = llama_cpp.llama_decode(self.ctx, batch)
+                
+                if ret != 0:
+                    logger.error(f"llama_decode failed at n_past {self.n_past}: {chunk}")
+                    return
+
                 self.n_past += 1
         finally:
             llama_cpp.llama_batch_free(batch)
@@ -228,7 +235,7 @@ class OrpheusModelLlamaCpp:
         top_indices = np.argsort(probs)[-top_n:][::-1]
         for token_id in top_indices:
             prob = probs[token_id]
-            logger.info(f"{token_id}: {prob:.4%}")
+            logger.debug(f"{token_id}: {prob:.4%}")
 
     def save_state(self) -> tuple[bytes, int]:
         state_size = llama_cpp.llama_get_state_size(self.ctx)
@@ -261,14 +268,14 @@ class OrpheusModelLlamaCpp:
         use_continuation: bool,
         streaming: bool = True
     ) -> Iterable[bytes]:
-        with Stopwatch("Full generation"):
+        with Stopwatch("Full generation") as fullSw:
             cache_key = (finetune_voice, voice_path, voice_transcript) if voice_path else None
 
             voice_text_ids, voice_audio_ids = None, None
             previous_text_ids, previous_audio_ids = None, None
             request_text_ids = None
 
-            with Stopwatch("Tokenize prompt") as sw:
+            with Stopwatch("- Tokenize prompt") as sw:
                 prefixed_prompt = f"{finetune_voice}: {prompt}" if finetune_voice else f"...: {prompt}"
                 request_text_ids = self.tokenize_text(prefixed_prompt)
                 sw.append(f"{len(request_text_ids)} tokens")
@@ -276,7 +283,7 @@ class OrpheusModelLlamaCpp:
             if voice_path:
                 voice_cached_ids = self.tokens_state_cache.get(cache_key)
                 if voice_cached_ids is None:
-                    with Stopwatch("Loading voice audio") as sw:
+                    with Stopwatch("- Loading voice audio") as sw:
                         prefixed_voice_transcript = f"{finetune_voice}: {voice_transcript}" if finetune_voice else f" {voice_transcript}"
                         voice_text_ids = self.tokenize_text(prefixed_voice_transcript)
                         voice_audio_ids = self.audio_model.load_audio(voice_path)
@@ -292,7 +299,7 @@ class OrpheusModelLlamaCpp:
                     self.previous_generation_cache = None
                     previous_text_ids, previous_audio_ids = None, None
             
-            with Stopwatch("Processing prompt") as sw:
+            with Stopwatch("- Processing prompt") as sw:
                 prompt_ids = self.prompt_formatter.format_prompt(
                     voice_text_ids=voice_text_ids,
                     voice_audio_ids=voice_audio_ids,
@@ -306,15 +313,19 @@ class OrpheusModelLlamaCpp:
                 self.process_tokens(prompt_ids)
                 sw.append(f"{len(prompt_ids)} tokens")
 
+            totalBytes = 0
             ttfbStopwatch = Stopwatch("Time to first byte")
             ttfbStopwatch.__enter__()
-            with Stopwatch("Generating speech") as sw, Stopwatch("Orpheus tokens", auto_start=False) as tkSw, Stopwatch("SNAC decode", auto_start=False) as swSnac, Stopwatch("Audio processing", auto_start=False) as swBytes:
+            with Stopwatch("- Generating speech") as sw, Stopwatch("  - Orpheus tokens", auto_start=False) as tkSw, Stopwatch("  - SNAC decode", auto_start=False) as swSnac, Stopwatch("  - Audio processing", auto_start=False) as swBytes:
                 SAMPLES_PER_FRAME = 2048
                 SNAC_TOKENS_PER_FRAME = 7
                 OVERLAP_FRAMES = 2
+                FADE_FRAMES = 2
                 OVERLAP_TOKENS = OVERLAP_FRAMES * SNAC_TOKENS_PER_FRAME
                 OVERLAP_SAMPLES = OVERLAP_FRAMES * SAMPLES_PER_FRAME
                 CHUNK_SIZE = SNAC_TOKENS_PER_FRAME * 5 # 100ms
+                MIN_FIRST_BUFFER_FRAMES = FADE_FRAMES + OVERLAP_FRAMES
+                
                 token_buffer = []
                 generated = []
                 pending_overlap_tokens = []
@@ -347,8 +358,23 @@ class OrpheusModelLlamaCpp:
                             hat = self.audio_model.convert_audio_tokens_to_speech(chunk_tokens)
                             swSnac.stop()
 
+                            if hat is None:
+                                continue
+
                             swBytes.start()
                             np_audio = self.audio_model.to_numpy_array(hat)
+                            
+                            if totalBytes == 0:
+                                np_audio_frames_count = np_audio.shape[0] / SAMPLES_PER_FRAME
+                                start_frame = self.find_start_frame_index(np_audio, samples_per_frame=SAMPLES_PER_FRAME)
+                                if start_frame > 0:
+                                    swBytes.append(f"(trimmed {start_frame} / {np_audio_frames_count} empty audio frames from start)")
+                                    if(np_audio_frames_count - start_frame) < MIN_FIRST_BUFFER_FRAMES:
+                                        start_frame = max(0, np_audio_frames_count - MIN_FIRST_BUFFER_FRAMES)
+                                    np_audio = np_audio[start_frame * SAMPLES_PER_FRAME:]
+                                    np_audio = self.apply_fade_in(np_audio, fade_frames=FADE_FRAMES, samples_per_frame=SAMPLES_PER_FRAME)
+                                else:
+                                    swBytes.append(f"(No empty audio frames found in start: {start_frame})")
 
                             # The actual chunk minus the final overlap (so we "keep aside" only the last frames)
                             main_chunk = np_audio[:-OVERLAP_SAMPLES] if len(np_audio) > OVERLAP_SAMPLES else np.array([], dtype=np.float32)
@@ -360,7 +386,9 @@ class OrpheusModelLlamaCpp:
 
                             # Yield main chunk (no overlap portion at the end)
                             if len(main_chunk) > 0:
-                                yield self.audio_model.to_bytes(main_chunk)
+                                bytes = self.audio_model.to_bytes(main_chunk)
+                                yield bytes
+                                totalBytes += len(bytes)
                                 if ttfbStopwatch:
                                     ttfbStopwatch.__exit__(None, None, None)
                                     ttfbStopwatch = None
@@ -387,42 +415,83 @@ class OrpheusModelLlamaCpp:
                         swSnac.start()
                         hat = self.audio_model.convert_audio_tokens_to_speech(chunk_tokens)
                         swSnac.stop()
-                        swBytes.start()
-                        np_audio = self.audio_model.to_numpy_array(hat)
 
-                        # Crossfade final chunk if needed
-                        if pending_overlap_audio is not None:
-                            main_chunk = self.crossfade(pending_overlap_audio, np_audio)
-                        else:
-                            main_chunk = np_audio
+                        if hat is not None:
+                            swBytes.start()
+                            np_audio = self.audio_model.to_numpy_array(hat)
 
-                        # Fade out TODO
+                            # Crossfade final chunk if needed
+                            if pending_overlap_audio is not None:
+                                main_chunk = self.crossfade(pending_overlap_audio, np_audio)
+                            else:
+                                main_chunk = np_audio
 
-                        yield self.audio_model.to_bytes(main_chunk)
-                        if ttfbStopwatch:
-                            ttfbStopwatch.__exit__(None, None, None)
-                            ttfbStopwatch = None
-
-                        generated += chunk_tokens
-                        swBytes.stop()
+                            bytes = self.audio_model.to_bytes(main_chunk)
+                            yield bytes
+                            totalBytes += len(bytes)
+                            if ttfbStopwatch:
+                                ttfbStopwatch.__exit__(None, None, None)
+                                ttfbStopwatch = None
+                            generated += chunk_tokens
+                            swBytes.stop()
 
             sw.append(f"{len(generated)} tokens")
             self.previous_generation_cache = (request_text_ids, generated)
         
-        if not streaming:
-            with Stopwatch("SNAC decoding"):
-                audio = self.audio_model.convert_audio_tokens_to_speech(generated)
+            if not streaming:
+                with Stopwatch("- SNAC decoding"):
+                    hat = self.audio_model.convert_audio_tokens_to_speech(generated)
 
-            with Stopwatch("Converting speech to audio") as sw:
-                bytes = self.audio_model.to_audio_bytes(audio)
-                sw.append(f"{len(bytes) / 1024:.2f} KB")
-                return bytes
+                if hat is not None:
+                    with Stopwatch("- Converting speech to audio") as sw:
+                        bytes = self.audio_model.to_audio_bytes(hat)
+                        sw.append(f"{len(bytes) / 1024:.2f} KB")
+                        yield bytes
+            
+            generation_duration = fullSw.duration()
+            generated_audio_duration = (totalBytes / (24000 * 2))
+            real_time_ratio = generated_audio_duration / generation_duration
+            fullSw.append(f"({generated_audio_duration:.2f}s audio generated, {real_time_ratio:.2f}x realtime speed)")
 
     def crossfade(self, prev: np.ndarray, current: np.ndarray) -> np.ndarray:
         fade_len = min(len(prev), len(current))
         fade = np.linspace(0, 1, fade_len)
         cross = prev[-fade_len:] * (1 - fade) + current[:fade_len] * fade
         return np.concatenate([cross, current[fade_len:]], axis=0)
+
+    def apply_fade_in(
+        self,
+        samples: np.ndarray,
+        fade_frames: int,
+        samples_per_frame: int = 2048
+    ) -> np.ndarray:
+        fade_samples = fade_frames * samples_per_frame
+        fade_samples = min(fade_samples, len(samples))
+        fade = np.linspace(0, 1, fade_samples, dtype=np.float32)
+        samples[:fade_samples] *= fade
+        return samples
+        
+    def find_start_frame_index(
+        self,
+        samples: np.ndarray,
+        threshold: float = 0.01,
+        window_frames: int = 1,
+        lookahead_frames: int = 5,
+        samples_per_frame: int = 2048
+    ) -> int:
+        total_frames = len(samples) // samples_per_frame
+        for frame_idx in range(0, total_frames - window_frames):
+            start = frame_idx * samples_per_frame
+            end = start + window_frames * samples_per_frame
+            window = samples[start:end]
+
+            if np.max(np.abs(window)) > threshold:
+                lookahead_start = start
+                lookahead_end = start + lookahead_frames * samples_per_frame
+                lookahead = samples[lookahead_start:lookahead_end]
+                if np.max(np.abs(lookahead)) > threshold:
+                    return max(frame_idx - lookahead_frames, 0)
+        return 0
     
     def __del__(self):
         if self._sampler_chain:
@@ -499,4 +568,4 @@ class OrpheusPromptFormatterLlamaCpp:
                 str = self.tts_model.detokenize_text([t], special=True)
                 result.append(f'{t}: "{str}"')
                 in_snac = False
-        logger.info(f"Prompt: {', '.join(result)}")
+        logger.debug(f"Prompt: {', '.join(result)}")

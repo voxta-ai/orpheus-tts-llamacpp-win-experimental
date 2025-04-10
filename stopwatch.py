@@ -28,7 +28,7 @@ class Stopwatch:
             delay = time.monotonic() - self.timer_start
             self.timer_sum += delay
             self.timer_start = None
-        logger.info(f"{self._name} ({self.timer_sum:.4f}s){'' if len(self._append) == 0 else ' ' + ', '.join(self._append) + ')'}")
+        logger.debug(f"{self._name} ({self.timer_sum:.4f}s){'' if len(self._append) == 0 else ' ' + ', '.join(self._append) + ')'}")
     
     def start(self):
         if not self._enabled:
@@ -42,6 +42,14 @@ class Stopwatch:
             delay = time.monotonic() - self.timer_start
             self.timer_sum += delay
             self.timer_start = None
+    
+    def duration(self):
+        if not self._enabled:
+            return 0
+        if self.timer_start is not None:
+            delay = time.monotonic() - self.timer_start
+            return self.timer_sum + delay
+        return self.timer_sum
 
     def append(self, text):
         if not self._enabled:

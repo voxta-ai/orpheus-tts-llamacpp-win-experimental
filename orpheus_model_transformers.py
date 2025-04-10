@@ -1,6 +1,7 @@
 import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import Iterable
 from collections import OrderedDict
 from snac_model_transformers import SnacModel
 from stopwatch import Stopwatch
@@ -30,6 +31,8 @@ class OrpheusModelTransformers:
 
         self.audio_model = audio_model
 
+        logger.warning(f"Orpheus: Using transformers for model inference, this is only supported for testing new safetensors versions, it has limited features and performance.")
+
     def _format_prompt(self, finetune_voice, voice_path, voice_text, text):
         # Tokenize the actual prompt text (for model generation)
         if finetune_voice:
@@ -43,15 +46,15 @@ class OrpheusModelTransformers:
         if voice_path:
             cache_key = (voice_path, voice_text)
             if cache_key in self._cache:
-                logger.info("Using cached input_ids")
+                logger.debug("Using cached input_ids")
                 zeroprompt_input_ids = self._cache[cache_key]
             else:
-                logger.info("Tokenizing voice")
+                logger.debug("Tokenizing voice")
                 st = time.monotonic()
                 voice_audio_tokens = self.audio_model.load_audio(voice_path)
                 voice_transcript_ids = self.tokenizer(voice_text, return_tensors="pt")["input_ids"]
                 zeroprompt_input_ids = torch.cat([start_tokens, voice_transcript_ids, end_tokens, torch.tensor([voice_audio_tokens], dtype=torch.int64), final_tokens], dim=1)
-                logger.info(f"Tokenized voice ({zeroprompt_input_ids.size(1)} tokens) in {time.monotonic() - st:.2f}s")
+                logger.debug(f"Tokenized voice ({zeroprompt_input_ids.size(1)} tokens) in {time.monotonic() - st:.2f}s")
                 if len(self._cache) > 9:
                     self._cache.popitem(last=False)
                 self._cache[cache_key] = zeroprompt_input_ids.cpu().detach().clone()
@@ -80,7 +83,7 @@ class OrpheusModelTransformers:
         repetition_penalty: float,
         greedy_snac_tokens: int,
         use_continuation: bool,
-    ) -> bytes:
+    ) -> Iterable[bytes]:
         if greedy_snac_tokens > 0:
             logger.warning("greedy_snac_tokens is not supported with safetensors")
         if use_continuation:
@@ -90,50 +93,44 @@ class OrpheusModelTransformers:
 
         input_ids, attention_mask = self._format_prompt(finetune_voice, voice_path, voice_transcript, prompt)
 
-        ## Print first and last 2 tokens
-        debug_tokens = []
-        for token in input_ids[0, :4]:
-            token_str = self.tokenizer.decode([token])
-            debug_tokens.append(f'{token} "{token_str}"')
-        debug_tokens.append("...")
-        for token in input_ids[0, -4:]:
-            token_str = self.tokenizer.decode([token])
-            debug_tokens.append(f'{token} "{token_str}"')
-        logger.info(f"Input: {', '.join(debug_tokens)}")
-
-        st = time.monotonic()
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=temperature,
-                # top_k=40,
-                min_p=min_p,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                num_return_sequences=1,
-                eos_token_id=128258,
-                pad_token_id=128258,
-            )
-        generated = generated_ids[0].tolist()
-        generated = generated[len(input_ids[0]):]
-        logger.info(f"Generated {len(generated)} tokens in {time.monotonic() - st:.2f}s")
-
-        debug_tokens = []
-        for token in generated[:8]:
-            token_str = self.tokenizer.decode([token])
-            debug_tokens.append(f'{token} "{token_str}"')
-        debug_tokens.append("...")
-        for token in generated[-8:]:
-            token_str = self.tokenizer.decode([token])
-            debug_tokens.append(f'{token} "{token_str}"')
-
-        logger.info(f"Tokens: {', '.join(debug_tokens)}")
+        with Stopwatch("Generating speech") as st:
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    # top_k=40,
+                    min_p=min_p,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    num_return_sequences=1,
+                    eos_token_id=128258,
+                    pad_token_id=128263,
+                )
+            generated = generated_ids[0].tolist()
+            generated = generated[len(input_ids[0]):]
+            # Find index of eos
+            if 128258 in generated:
+                eos_index = generated.index(128258)
+                if eos_index < len(generated) - 1:
+                    st.append(f"waste: {len(generated) - eos_index}")
+                generated = generated[:eos_index]
+            st.append(f"{len(generated)} tokens")
+        
+        # check if generated is a multiple of 7
+        if len(generated) % 7 != 0:
+            logger.warning(f"Generated length is not a multiple of 7: {len(generated)}")
+        min_token_id = 128266
+        max_token_id = min_token_id + 8192
+        bad_tokens = [t for t in generated if t < min_token_id or t > max_token_id]
+        if len(bad_tokens) > 0:
+            logger.warning(f"Generated {len(bad_tokens)} bad tokens: {bad_tokens}")
 
         with Stopwatch("Converting speech to audio") as sw:
-            audio = self.audio_model.convert_audio_tokens_to_speech(generated)
-            bytes = self.audio_model.to_audio_bytes(audio)
+            hat = self.audio_model.convert_audio_tokens_to_speech(generated)
+            np_audio = self.audio_model.to_numpy_array(hat)
+            bytes = self.audio_model.to_bytes(np_audio)
             sw.append(f"{len(bytes) / 1024:.2f} KB")
-            return bytes
+            yield bytes
