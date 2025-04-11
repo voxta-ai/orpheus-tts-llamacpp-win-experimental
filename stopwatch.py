@@ -5,7 +5,7 @@ logger = logging.getLogger(__name__)
 
 class Stopwatch:
     def __init__(self, name: str, auto_start: bool = True):
-        self._enabled = logger.isEnabledFor(logging.INFO)
+        self._enabled = logger.isEnabledFor(logging.DEBUG)
         self.auto_start = auto_start
         self._name = name
         self._append: list[str] = []

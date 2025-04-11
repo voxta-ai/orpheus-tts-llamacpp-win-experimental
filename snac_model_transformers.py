@@ -20,7 +20,7 @@ class SnacModel:
         st.load_model(model, safetensors_path, device=self.snac_device)
         self.snac_model = torch.compile(
             model.to(self.snac_device),
-            mode="max-autotune"
+            mode="reduce-overhead"
         )
 
     def load_audio(self, voice_path: str):

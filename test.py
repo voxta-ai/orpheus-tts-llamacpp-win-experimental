@@ -8,7 +8,7 @@ import wave
 import winsound
 from orpheus_engine import create_orpheus_engine
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger()
 
 class OrpheusTest:
@@ -88,6 +88,7 @@ class OrpheusTest:
             voice_transcript=self.voice_transcript,
             voice_path=self.voice_wav,
             use_continuation=False,
+            top_k=320,
             min_p=0,
             top_p=0.9,
             temperature=0.8,

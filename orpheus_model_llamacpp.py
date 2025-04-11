@@ -110,6 +110,7 @@ class OrpheusModelLlamaCpp:
             max_tokens: int,
             stop_token_ids: list[int],
             temperature: float,
+            top_k: int,
             top_p: float,
             min_p: float,
             repetition_penalty: float,
@@ -119,9 +120,9 @@ class OrpheusModelLlamaCpp:
         greedy_snac_tokens = min(7, max(0, greedy_snac_tokens))
 
         with Stopwatch("llama_cpp create samplers"):
-            sampler_chain = self._acquire_sampler_chain(temperature, top_p, min_p, repetition_penalty)
+            sampler_chain = self._acquire_sampler_chain(temperature, top_p, top_k, min_p, repetition_penalty)
             greedy_chain = self._acquire_greedy_chain() if greedy_snac_tokens else None
-            continuation_chain = self._acquire_continuation_chain(temperature, top_p, min_p, repetition_penalty) if force_continuation else None
+            continuation_chain = self._acquire_continuation_chain(temperature, top_p, top_k, min_p, repetition_penalty) if force_continuation else None
 
         continuation_remaining = force_continuation
         snac_index = 0
@@ -181,8 +182,8 @@ class OrpheusModelLlamaCpp:
         self._greedy_sampler_chain = chain
         return chain
 
-    def _acquire_continuation_chain(self, temperature: float, top_p: float, min_p: float, repetition_penalty: float):
-        if self._validate_cached_chain(temperature, top_p, min_p, repetition_penalty):
+    def _acquire_continuation_chain(self, temperature: float, top_k: int, top_p: float, min_p: float, repetition_penalty: float):
+        if self._validate_cached_chain(temperature, top_p, top_k, min_p, repetition_penalty):
             return self._continuation_sampler_chain
         sparams = llama_cpp.llama_sampler_chain_default_params()
         chain = llama_cpp.llama_sampler_chain_init(sparams)
@@ -190,18 +191,18 @@ class OrpheusModelLlamaCpp:
         bias_arr[0].token = 128258
         bias_arr[0].bias = -1e9
         llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_logit_bias(self.vocab, 1, bias_arr))
-        self._configure_sampler_chain_common(chain, temperature, top_p, min_p, repetition_penalty)
+        self._configure_sampler_chain_common(chain, temperature, top_p, top_k, min_p, repetition_penalty)
         return chain
 
-    def _acquire_sampler_chain(self, temperature: float, top_p: float, min_p: float, repetition_penalty: float):
-        if self._validate_cached_chain(temperature, top_p, min_p, repetition_penalty):
+    def _acquire_sampler_chain(self, temperature: float, top_k: int, top_p: float, min_p: float, repetition_penalty: float):
+        if self._validate_cached_chain(temperature, top_p, top_k, min_p, repetition_penalty):
             return self._sampler_chain
         sparams = llama_cpp.llama_sampler_chain_default_params()
         chain = llama_cpp.llama_sampler_chain_init(sparams)
-        self._configure_sampler_chain_common(chain, temperature, top_p, min_p, repetition_penalty)
+        self._configure_sampler_chain_common(chain, temperature, top_p, top_k, min_p, repetition_penalty)
         return chain
     
-    def _configure_sampler_chain_common(self, chain, temperature: float, top_p: float, min_p: float, repetition_penalty: float):
+    def _configure_sampler_chain_common(self, chain, temperature: float, top_k: int, top_p: float, min_p: float, repetition_penalty: float):
         llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_k(400))
         if repetition_penalty != 1:
             llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_penalties(64, repetition_penalty, 0.0, 0.0))
@@ -213,8 +214,8 @@ class OrpheusModelLlamaCpp:
         seed = struct.unpack("I", os.urandom(4))[0]
         llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_dist(seed))
 
-    def _validate_cached_chain(self, temperature: float, top_p: float, min_p: float, repetition_penalty: float) -> bool:
-        cache_params = (temperature, top_p, min_p, repetition_penalty)
+    def _validate_cached_chain(self, temperature: float, top_k: int, top_p: float, min_p: float, repetition_penalty: float) -> bool:
+        cache_params = (temperature, top_p, top_k, min_p, repetition_penalty)
         if not self._continuation_sampler_chain:
             return False
 
@@ -266,6 +267,7 @@ class OrpheusModelLlamaCpp:
         previous_text: str,
         reply_to: str,
         temperature: float,
+        top_k: int,
         top_p: float,
         min_p: float,
         max_tokens: int,
@@ -342,6 +344,7 @@ class OrpheusModelLlamaCpp:
                         max_tokens=max_tokens,
                         stop_token_ids=self.prompt_formatter.STOP, 
                         temperature=temperature,
+                        top_k=top_k,
                         top_p=top_p,
                         min_p=min_p,
                         repetition_penalty=repetition_penalty,
