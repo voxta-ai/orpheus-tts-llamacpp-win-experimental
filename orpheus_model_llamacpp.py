@@ -118,9 +118,10 @@ class OrpheusModelLlamaCpp:
         ) -> Iterable[int]:
         greedy_snac_tokens = min(7, max(0, greedy_snac_tokens))
 
-        sampler_chain = self._acquire_sampler_chain(temperature, top_p, min_p, repetition_penalty)
-        greedy_chain = self._acquire_greedy_chain() if greedy_snac_tokens else None
-        continuation_chain = self._acquire_continuation_chain(temperature, top_p, min_p, repetition_penalty) if force_continuation else None
+        with Stopwatch("llama_cpp create samplers"):
+            sampler_chain = self._acquire_sampler_chain(temperature, top_p, min_p, repetition_penalty)
+            greedy_chain = self._acquire_greedy_chain() if greedy_snac_tokens else None
+            continuation_chain = self._acquire_continuation_chain(temperature, top_p, min_p, repetition_penalty) if force_continuation else None
 
         continuation_remaining = force_continuation
         snac_index = 0
@@ -128,43 +129,48 @@ class OrpheusModelLlamaCpp:
         first = True
         batch = llama_cpp.llama_batch_init(1, 0, 1)
 
-        try:
-            for _ in range(max_tokens):
-                chain = sampler_chain
-                if greedy_chain and snac_index >= snac_greedy:
-                    chain = greedy_chain
-                elif continuation_remaining > 0:
-                    chain = continuation_chain or chain
+        with Stopwatch("generate_tokens"), Stopwatch("llamacpp sample", auto_start=False) as st_sample, Stopwatch("llamacpp decode", auto_start=False) as st_decode:
+            try:
+                for _ in range(max_tokens):
+                    chain = sampler_chain
+                    if greedy_chain and snac_index >= snac_greedy:
+                        chain = greedy_chain
+                    elif continuation_remaining > 0:
+                        chain = continuation_chain or chain
 
-                snac_index = (snac_index + 1) % 7
-                if continuation_remaining > 0:
-                    continuation_remaining -= 1
+                    snac_index = (snac_index + 1) % 7
+                    if continuation_remaining > 0:
+                        continuation_remaining -= 1
 
-                token_id = llama_cpp.llama_sampler_sample(chain, self.ctx, -1)
+                    st_sample.start()
+                    token_id = llama_cpp.llama_sampler_sample(chain, self.ctx, -1)
+                    st_sample.stop()
 
-                if token_id in stop_token_ids:
-                    if first:
-                        logger.warning(f"Stopping early due to stop token {token_id}")
-                    break
-                first = False
+                    if token_id in stop_token_ids:
+                        if first:
+                            logger.warning(f"Stopping early due to stop token {token_id}")
+                        break
+                    first = False
 
-                yield token_id
-                
-                batch.n_tokens = 1
-                batch.token[0] = token_id
-                batch.pos[0] = self.n_past
-                batch.seq_id[0][0] = 0
-                batch.n_seq_id[0] = 1
-                batch.logits[0] = True
-                ret = llama_cpp.llama_decode(self.ctx, batch)
-                
-                if ret != 0:
-                    logger.error(f"llama_decode failed at n_past {self.n_past}: {chunk}")
-                    return
+                    yield token_id
+                    
+                    st_decode.start()
+                    batch.n_tokens = 1
+                    batch.token[0] = token_id
+                    batch.pos[0] = self.n_past
+                    batch.seq_id[0][0] = 0
+                    batch.n_seq_id[0] = 1
+                    batch.logits[0] = True
+                    ret = llama_cpp.llama_decode(self.ctx, batch)
+                    st_decode.stop()
+                    
+                    if ret != 0:
+                        logger.error(f"llama_decode failed at n_past {self.n_past}: {token_id}")
+                        return
 
-                self.n_past += 1
-        finally:
-            llama_cpp.llama_batch_free(batch)
+                    self.n_past += 1
+            finally:
+                llama_cpp.llama_batch_free(batch)
     
     def _acquire_greedy_chain(self):
         if self._greedy_sampler_chain:
@@ -196,9 +202,9 @@ class OrpheusModelLlamaCpp:
         return chain
     
     def _configure_sampler_chain_common(self, chain, temperature: float, top_p: float, min_p: float, repetition_penalty: float):
+        llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_k(400))
         if repetition_penalty != 1:
             llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_penalties(64, repetition_penalty, 0.0, 0.0))
-        # llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_k(100))
         if top_p < 1.0:
             llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_p(top_p, 1))
         if min_p > 0.0:

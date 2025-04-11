@@ -25,6 +25,7 @@ class OrpheusTest:
         parser.add_argument("--voice", default="tara")
         parser.add_argument("--voice-wav", default=None, type=str)
         parser.add_argument("--voice-transcript", default=None, type=str)
+        parser.add_argument("--greedy-snac-tokens", default=0, type=int)
         args = parser.parse_args()
 
         if args.max_tokens % 7 != 0:
@@ -45,6 +46,7 @@ class OrpheusTest:
         self.voice = args.voice
         self.voice_wav = args.voice_wav
         self.voice_transcript = args.voice_transcript
+        self.greedy_snac_tokens = args.greedy_snac_tokens
 
         self.model_filename = os.path.basename(args.model_path)
 
@@ -80,7 +82,7 @@ class OrpheusTest:
         buffer = io.BytesIO()
         for chunk in self.engine.generate_speech(
             finetune_voice=self.voice,
-            greedy_snac_tokens=3,
+            greedy_snac_tokens=self.greedy_snac_tokens,
             max_tokens=self.max_tokens,
             prompt=self.text,
             voice_transcript=self.voice_transcript,
