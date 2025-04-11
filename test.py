@@ -21,7 +21,7 @@ class OrpheusTest:
         parser.add_argument("--runs", default=5, type=int)
         parser.add_argument("--play-test", default=False, action="store_true")
         parser.add_argument("--text", default="Hello <laugh>, my name is uhm, Orpheus. I'm saying something a bit long so we reach the total amount of tokens <cough> and we're sure to be cut off.")
-        parser.add_argument("--max_tokens", default=294, type=int)
+        parser.add_argument("--max-tokens", default=294, type=int)
         parser.add_argument("--voice", default="tara")
         parser.add_argument("--voice-wav", default=None, type=str)
         parser.add_argument("--voice-transcript", default=None, type=str)
